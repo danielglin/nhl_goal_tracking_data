@@ -5,7 +5,6 @@ use reqwest::blocking::Client;
 use reqwest::header::HeaderMap;
 
 use serde::{Deserialize, Serialize};
-// use serde_json::{Value};
 
 use std::fs::File;
 use std::io::Write;
@@ -15,40 +14,45 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::api_calls::week_or_shorter_period::WeekOrShorterPeriod;
 
-// pub struct Season(pub String);
-// #[derive(Clone, Debug)]
-// pub struct GameId(pub String);
-// pub struct GoalId(pub u16);
-
 /// Saves the tracking data for a goal to a file
 /// This requires headers to get the data from the NHL site.
 pub fn save_goal_data<P>(
     client: &Client,
     headers: HeaderMap,
-    game: &Game,
+    // game: &Game,
+    // landing_resp: &LandingResponse,
+    season: u32,
+    game_id: u32,
     goal: &GoalDetails,
     output_path: P,
 ) -> Result<()>
 where
     P: AsRef<Path>,
 {
+    const LEN_THRESHOLD: usize = 10;
+
     // get the tracking data
     let api_url = match &goal.ppt_replay_url {
         Some(url) => url.to_string(),
         None => format!(
             "https://wsr.nhle.com/sprites/{}/{}/ev{}.json",
-            game.season, game.id, goal.event_id
+            season, game_id, goal.event_id
         ),
     };
     let resp = client.get(api_url).headers(headers).send()?;
     if resp.status() == 200 {
         let resp_text = resp.text()?;
 
+        // there are rare cases where the response is an empty string or have 
+        // no info, so we should print out a warning for that
+        if resp_text.len() < LEN_THRESHOLD {
+            println!("Empty response string for season: {}, game id: {}, goal id: {}", season, game_id, goal.event_id);
+        }
         // save the data to a file
         let mut file = File::create(output_path).with_context(|| {
             format!(
                 "Failed to write tracking data for season: {}, game id: {}, goal id: {} to a file",
-                game.season, game.id, goal.event_id
+                season, game_id, goal.event_id
             )
         })?;
         write!(file, "{}", resp_text)?;
@@ -56,7 +60,7 @@ where
     } else {
         let err_msg = format!(
             "Unable to get data for season: {}, game id: {}, goal id: {}",
-            game.season, game.id, goal.event_id
+            season, game_id, goal.event_id
         );
         Err(anyhow!(err_msg))
     }
@@ -142,9 +146,6 @@ pub mod week_or_shorter_period {
 // Gets the game ids that fall within a period
 // The period should be a week or shorter.
 pub fn get_game_ids_period(
-    //     schedule: &ScheduleResponse,
-    // start_date: &NaiveDate,
-    // end_date: &NaiveDate
     client: &Client,
     week: &WeekOrShorterPeriod,
 ) -> Result<Vec<Game>> {
@@ -178,20 +179,16 @@ pub fn get_game_ids_period(
 #[derive(Deserialize, Debug)]
 pub struct PbpResponse {
     plays: Vec<Event>,
-}
-
-/// play-by-play info along with the game id
-#[derive(Debug)]
-pub struct PbpInfo {
-    plays: Vec<Event>,
-    game_id: u32,
+    pub id: u32, // this is the game id
+    pub season: u32,
+    homeTeam: Team,
+    pub gameDate: String
 }
 
 #[derive(Deserialize, Debug)]
 pub struct Event {
     eventId: u32,
     homeTeamDefendingSide: String,
-    // typeCode: u16,
     typeDescKey: String,
     pptReplayUrl: Option<String>,
     details: Option<EventDetails>, // details isn't always present
@@ -230,18 +227,15 @@ pub struct GoalDetails {
 /// helper struct to serialize extra info needed for all the goals in a game
 #[derive(Debug, Serialize)]
 pub struct PbpBoxscoreInfo {
-    // event_id: u32,
-    // scoring_team_id: u16,
-    // home_team_defending_side: String,
     goals: Vec<GoalDetails>,
     home_team_id: u16,
 }
 
 /// Get the pbp data for a game
-pub fn get_pbp_data(client: &Client, game: &Game) -> Result<PbpInfo> {
+pub fn get_pbp_data(client: &Client, game_id: &str) -> Result<PbpResponse> {
     let pbp_url = format!(
         "https://api-web.nhle.com/v1/gamecenter/{}/play-by-play",
-        game.id
+        game_id
     );
     let resp = client.get(pbp_url).send()?;
 
@@ -249,22 +243,16 @@ pub fn get_pbp_data(client: &Client, game: &Game) -> Result<PbpInfo> {
         let resp_text = resp.text()?;
         let pbp_resp: PbpResponse = serde_json::from_str(&resp_text)?;
 
-        // add in the game id so we don't have just play-by-play
-        // info withou a way to tie back to a game
-        let pbp_info = PbpInfo {
-            plays: pbp_resp.plays,
-            game_id: game.id,
-        };
-        Ok(pbp_info)
+        Ok(pbp_resp)
     } else {
-        let err_msg = format!("Unable to get play-by-play for game id: {}, response status: {}.", game.id, resp.status());
+        let err_msg = format!("Unable to get play-by-play for game id: {}, response status: {}.", game_id, resp.status());
         Err(anyhow!(err_msg))
     }
 }
 
 /// From data returned by the play-by-play API, get just the goal
 /// data for a game
-pub fn parse_goal_data(mut pbp: PbpInfo) -> Vec<GoalDetails> {
+pub fn parse_goal_data(mut pbp: PbpResponse) -> GameExportData {
     let mut goals = vec![];
 
     // first we need to filter the plays to just the non-shootout goals
@@ -283,18 +271,9 @@ pub fn parse_goal_data(mut pbp: PbpInfo) -> Vec<GoalDetails> {
         } else if goal_event.homeTeamDefendingSide == "right" {
             IceSide::Right
         } else {
-            println!("Invalid side for goal {} in game {}", event_id, pbp.game_id);
+            println!("Invalid side for goal {} in game {}", event_id, pbp.id);
             continue;
         };
-
-        // // get the location JSON URL
-        // let ppt_replay_url = match goal_event.pptReplayUrl {
-        //     Some(url) => url,
-        //     None => {
-        //         println!("No location JSON URL found for goal {} in game {}", event_id, pbp.game_id);
-        //         continue;
-        //     }
-        // };
 
         match goal_event.details {
             Some(details) => {
@@ -306,7 +285,7 @@ pub fn parse_goal_data(mut pbp: PbpInfo) -> Vec<GoalDetails> {
                     None => {
                         println!(
                             "No scoring team id for goal {} in game {}",
-                            event_id, pbp.game_id
+                            event_id, pbp.id
                         );
                         continue;
                     }
@@ -324,12 +303,12 @@ pub fn parse_goal_data(mut pbp: PbpInfo) -> Vec<GoalDetails> {
             // if we don't have the details for a goal, don't add it to the
             // vec
             None => {
-                println!("No details for goal {} in game {}", event_id, pbp.game_id);
+                println!("No details for goal {} in game {}", event_id, pbp.id);
                 continue;
             }
         }
     }
-    goals
+    GameExportData { home_team_id: pbp.homeTeam.id, goals: goals }
 }
 
 /////////////////////
@@ -343,14 +322,8 @@ pub struct BoxscoreResponse {
     homeTeam: Team,
 }
 
-#[derive(Deserialize, Debug)]
-pub struct Team {
-    id: u16,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct BoxscoreInfo {
-    // game_id: u32,
     home_team_id: u16,
 }
 
@@ -390,6 +363,135 @@ pub fn combine_pbp_boxscore_info(
         goals: pbp,
         home_team_id: boxscore_info.home_team_id,
     }
+}
+
+/// struct for the response from the landing endpoint, which has all the info
+/// needed to get the goal tracking data for a game
+#[derive(Deserialize, Debug)]
+pub struct LandingResponse {
+    // game info
+    pub id: u32,
+    pub season: u32,
+    pub gameDate: String,
+    homeTeam: Team,
+    awayTeam: Team,
+
+    // goal info
+    summary: Summary
+}
+
+#[derive(Deserialize, Debug)]
+struct Team {
+    id: u16,
+}
+
+#[derive(Deserialize, Debug)]
+struct Summary {
+    scoring: Vec<Period>
+}
+
+#[derive(Deserialize, Debug)]
+struct Period {
+    periodDescriptor: PeriodDetails,
+    goals: Vec<GoalInfo>
+}
+
+#[derive(Deserialize, Debug)]
+struct PeriodDetails {
+    periodType: String
+}
+
+#[derive(Deserialize, Debug)]
+struct GoalInfo {
+    eventId: u32,
+    pptReplayUrl: Option<String>,
+    homeTeamDefendingSide: String,
+    isHome: bool
+}
+
+/// Use the landing endpoint to get all the necessary information for a game:
+/// Game details:
+///     - game id
+///     - season id
+///     - start date
+///     - home team id
+/// Goal details:
+///     - event id
+///     - home team defending side
+///     - tracking JSON URL
+///     - scoring team
+pub fn get_game_info(game_id: &str, client: &Client) -> Result<LandingResponse> {
+    let landing_url = format!(
+        "https://api-web.nhle.com/v1/gamecenter/{}/landing",
+        game_id
+    );
+    let resp = client.get(landing_url).send()?;
+
+    if resp.status() == 200 {
+        let resp_text = resp.text()?;
+        let landing_resp: LandingResponse = serde_json::from_str(&resp_text)?;
+
+        Ok(landing_resp)
+    } else {
+        let err_msg = format!("Unable to get landing info for game id: {}, response status: {}.", game_id, resp.status());
+        Err(anyhow!(err_msg))
+    }
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct GameExportData {
+    pub goals: Vec<GoalDetails>,
+    home_team_id: u16
+}
+
+/// From the landing response, get the game and goal data that's needed
+/// in addition to the tracking JSON's
+pub fn extract_export_game_data(landing_resp: &LandingResponse) -> Result<GameExportData> {
+    // have to go through all the fields in the landing response in order to 
+    // get to the goal data
+    let mut goals = vec![];
+    for period in &landing_resp.summary.scoring {
+        // TODO: check that the period isn't the shootout
+        // don't want to include shootout goals
+        if period.periodDescriptor.periodType == "SO" {
+            continue;
+        }
+
+        for g in &period.goals {
+            // need to figure out the scoring team id by looking at if the 
+            // home team scored or not, and then getting the corresponding
+            // team id
+            let scoring_team_id = if g.isHome {
+                landing_resp.homeTeam.id
+            } else {
+                landing_resp.awayTeam.id
+            };
+
+            // convert home team ice side from string to enum
+            let home_team_defending_side = if g.homeTeamDefendingSide == "left" {
+                IceSide::Left
+            } else if g.homeTeamDefendingSide == "right" {
+                IceSide::Right
+            } else {
+                return Err(anyhow!("Invalid side for goal {} in game {}", g.eventId, landing_resp.id));
+            };
+
+            goals.push(GoalDetails {
+                event_id: g.eventId,
+                ppt_replay_url: g.pptReplayUrl.clone(),
+                scoring_team_id: scoring_team_id,
+                home_team_defending_side: home_team_defending_side
+            })
+        }
+    }
+
+    Ok(GameExportData { goals: goals, home_team_id: landing_resp.homeTeam.id })
+}
+
+/// Get just the goal data needed to pull the tracking JSON's from the landing
+/// response
+pub fn extract_goals() {
+
 }
 
 #[cfg(test)]
@@ -635,11 +737,11 @@ mod tests {
                 periodType: String::from("REG"),
             },
         }];
-        let pbp_info = PbpInfo { game_id: 1, plays };
+        let pbp_info = PbpResponse { plays: plays, id: 1, season: 20252025, homeTeam: Team { id: 19 }, gameDate: String::from("2025-05-02") };
 
         let actual_goal_details = parse_goal_data(pbp_info);
 
-        assert_eq!(actual_goal_details.len(), 0);
+        assert_eq!(actual_goal_details.goals.len(), 0);
     }
 
     // one goals results in a vec with just that one goal
@@ -671,7 +773,7 @@ mod tests {
                 },
             },
         ];
-        let pbp_info = PbpInfo { game_id: 1, plays };
+        let pbp_info = PbpResponse { plays: plays, id: 1, season: 20252025, homeTeam: Team { id: 19 }, gameDate: String::from("2025-05-02") };
 
         let actual_goal_details = parse_goal_data(pbp_info);
         let expected_goal_details = vec![GoalDetails {
@@ -681,7 +783,7 @@ mod tests {
             scoring_team_id: 1,
         }];
 
-        assert_eq!(actual_goal_details, expected_goal_details);
+        assert_eq!(actual_goal_details.goals, expected_goal_details);
     }
 
     // several goals results in a vec with just all the goals
@@ -749,7 +851,7 @@ mod tests {
                 },
             },
         ];
-        let pbp_info = PbpInfo { game_id: 1, plays };
+        let pbp_info = PbpResponse { plays: plays, id: 1, season: 20252025, homeTeam: Team { id: 19 }, gameDate: String::from("2025-05-02") };
 
         let actual_goal_details = parse_goal_data(pbp_info);
         let expected_goal_details = vec![
@@ -773,7 +875,7 @@ mod tests {
             },
         ];
 
-        assert_eq!(actual_goal_details, expected_goal_details);
+        assert_eq!(actual_goal_details.goals, expected_goal_details);
     }
 
     // a game with only shootout goals should have no goals
@@ -841,12 +943,12 @@ mod tests {
                 },
             },
         ];
-        let pbp_info = PbpInfo { game_id: 2, plays };
+        let pbp_info = PbpResponse { plays: plays, id: 1, season: 20252025, homeTeam: Team { id: 19 }, gameDate: String::from("2025-05-02") };
 
         let actual_goal_details = parse_goal_data(pbp_info);
         let expected_goal_details = vec![];
 
-        assert_eq!(actual_goal_details, expected_goal_details);
+        assert_eq!(actual_goal_details.goals, expected_goal_details);
     }
 
     // a game with both regular goals and shootout goals should have just
@@ -915,7 +1017,7 @@ mod tests {
                 },
             },
         ];
-        let pbp_info = PbpInfo { game_id: 2, plays };
+        let pbp_info = PbpResponse { plays: plays, id: 1, season: 20252025, homeTeam: Team { id: 19 }, gameDate: String::from("2025-05-02") };
 
         let actual_goal_details = parse_goal_data(pbp_info);
         let expected_goal_details = vec![GoalDetails {
@@ -925,7 +1027,7 @@ mod tests {
             scoring_team_id: 1,
         }];
 
-        assert_eq!(actual_goal_details, expected_goal_details);
+        assert_eq!(actual_goal_details.goals, expected_goal_details);
     }
 
     // a agme with both regulation goals and an overtime goal
@@ -993,7 +1095,7 @@ mod tests {
                 },
             },
         ];
-        let pbp_info = PbpInfo { game_id: 2, plays };
+        let pbp_info = PbpResponse { plays: plays, id: 1, season: 20252025, homeTeam: Team { id: 19 }, gameDate: String::from("2025-05-02") };
 
         let actual_goal_details = parse_goal_data(pbp_info);
         let expected_goal_details = vec![
@@ -1017,7 +1119,7 @@ mod tests {
             },
         ];
 
-        assert_eq!(actual_goal_details, expected_goal_details);
+        assert_eq!(actual_goal_details.goals, expected_goal_details);
     }
 
     // a game where some goals don't have the replay URL
@@ -1086,7 +1188,7 @@ mod tests {
                 },
             },
         ];
-        let pbp_info = PbpInfo { game_id: 2, plays };
+        let pbp_info = PbpResponse { plays: plays, id: 1, season: 20252025, homeTeam: Team { id: 19 }, gameDate: String::from("2025-05-02") };
 
         let actual_goal_details = parse_goal_data(pbp_info);
         let expected_goal_details = vec![
@@ -1110,6 +1212,287 @@ mod tests {
             },
         ];
 
-        assert_eq!(actual_goal_details, expected_goal_details);
+        assert_eq!(actual_goal_details.goals, expected_goal_details);
+    }
+
+    //////////////////////////////////////////
+    //
+    // Landing endpoint tests
+    //
+    //////////////////////////////////////////
+    
+    // Game with only regulation goals should have all goals 
+    #[test]
+    fn extract_export_game_data_regl_only() {
+        let period_1 = Period { 
+            periodDescriptor: PeriodDetails { 
+                periodType: String::from("REG"),
+            },
+            goals: vec![GoalInfo { eventId: 12, pptReplayUrl: Some(String::from("nhl.com")), homeTeamDefendingSide: String::from("right"), isHome: false}]
+        };
+        let period_2 = Period { 
+            periodDescriptor: PeriodDetails { 
+                periodType: String::from("REG"),
+            },
+            goals: vec![]
+        };
+        let period_3 = Period { 
+            periodDescriptor: PeriodDetails { 
+                periodType: String::from("REG"),
+            },
+            goals: vec![
+                GoalInfo { eventId: 120, pptReplayUrl: Some(String::from("nhl.com")), homeTeamDefendingSide: String::from("right"), isHome: false},
+                GoalInfo { eventId: 170, pptReplayUrl: Some(String::from("nhl.com")), homeTeamDefendingSide: String::from("left"), isHome: true},
+            ]
+        };
+        let summary = Summary { 
+            scoring: vec![
+                period_1,
+                period_2, 
+                period_3
+            ]
+        };
+        let landing_resp = LandingResponse { 
+            id: 2024000201, season: 20242025, gameDate: String::from("2024-10-29"), 
+            homeTeam: Team { id: 10 }, awayTeam: Team { id: 19 }, summary: summary };
+        
+        let actual_game_export = extract_export_game_data(&landing_resp).unwrap();
+        let expected_game_export = GameExportData {
+            home_team_id: 10,
+            goals: vec![
+                GoalDetails {
+                    event_id: 12,
+                    ppt_replay_url: Some(String::from("nhl.com")),
+                    scoring_team_id: 19,
+                    home_team_defending_side: IceSide::Right
+                },
+                GoalDetails {
+                    event_id: 120,
+                    ppt_replay_url: Some(String::from("nhl.com")),
+                    scoring_team_id: 19,
+                    home_team_defending_side: IceSide::Right
+                },
+                GoalDetails {
+                    event_id: 170,
+                    ppt_replay_url: Some(String::from("nhl.com")),
+                    scoring_team_id: 10,
+                    home_team_defending_side: IceSide::Left
+                },
+            ]
+        };
+
+        assert_eq!(actual_game_export, expected_game_export);
+    }
+
+    // Game with only shootout goals should not have any goals
+    #[test]
+    fn extract_export_game_data_so_only() {
+        let period_1 = Period { 
+            periodDescriptor: PeriodDetails { 
+                periodType: String::from("REG"),
+            },
+            goals: vec![]
+        };
+        let period_2 = Period { 
+            periodDescriptor: PeriodDetails { 
+                periodType: String::from("REG"),
+            },
+            goals: vec![]
+        };
+        let period_3 = Period { 
+            periodDescriptor: PeriodDetails { 
+                periodType: String::from("REG"),
+            },
+            goals: vec![]
+        };
+        let ot = Period { 
+            periodDescriptor: PeriodDetails { 
+                periodType: String::from("OT"),
+            },
+            goals: vec![]
+        };
+        let shootout = Period { 
+            periodDescriptor: PeriodDetails { 
+                periodType: String::from("SO"),
+            },
+            goals: vec![
+                GoalInfo { eventId: 486, pptReplayUrl: Some(String::from("nhl.com")), homeTeamDefendingSide: String::from("right"), isHome: false}
+            ]
+        };
+        let summary = Summary { 
+            scoring: vec![
+                period_1,
+                period_2, 
+                period_3,
+                ot,
+                shootout
+            ]
+        };
+        let landing_resp = LandingResponse { 
+            id: 2024000201, season: 20242025, gameDate: String::from("2024-10-29"), 
+            homeTeam: Team { id: 10 }, awayTeam: Team { id: 19 }, summary: summary };
+        
+        let actual_game_export = extract_export_game_data(&landing_resp).unwrap();
+        let expected_game_export = GameExportData {
+            home_team_id: 10,
+            goals: vec![]
+        };
+
+        assert_eq!(actual_game_export, expected_game_export);
+    }
+
+    // Game with regulation and shootout goals should only have the regulation
+    // goals
+    #[test]
+    fn extract_export_game_data_regl_so() {
+        let period_1 = Period { 
+            periodDescriptor: PeriodDetails { 
+                periodType: String::from("REG"),
+            },
+            goals: vec![
+                GoalInfo { eventId: 12, pptReplayUrl: Some(String::from("nhl.com")), homeTeamDefendingSide: String::from("right"), isHome: false}
+            ]
+        };
+        let period_2 = Period { 
+            periodDescriptor: PeriodDetails { 
+                periodType: String::from("REG"),
+            },
+            goals: vec![]
+        };
+        let period_3 = Period { 
+            periodDescriptor: PeriodDetails { 
+                periodType: String::from("REG"),
+            },
+            goals: vec![]
+        };
+        let ot = Period { 
+            periodDescriptor: PeriodDetails { 
+                periodType: String::from("OT"),
+            },
+            goals: vec![]
+        };
+        let shootout = Period { 
+            periodDescriptor: PeriodDetails { 
+                periodType: String::from("SO"),
+            },
+            goals: vec![
+                GoalInfo { eventId: 486, pptReplayUrl: Some(String::from("nhl.com")), homeTeamDefendingSide: String::from("right"), isHome: false}
+            ]
+        };
+        let summary = Summary { 
+            scoring: vec![
+                period_1,
+                period_2, 
+                period_3,
+                ot,
+                shootout
+            ]
+        };
+        let landing_resp = LandingResponse { 
+            id: 2024000201, season: 20242025, gameDate: String::from("2024-10-29"), 
+            homeTeam: Team { id: 10 }, awayTeam: Team { id: 19 }, summary: summary };
+        
+        let actual_game_export = extract_export_game_data(&landing_resp).unwrap();
+        let expected_game_export = GameExportData {
+            home_team_id: 10,
+            goals: vec![
+                GoalDetails {
+                    event_id: 12,
+                    ppt_replay_url: Some(String::from("nhl.com")),
+                    scoring_team_id: 19,
+                    home_team_defending_side: IceSide::Right
+                },
+            ]
+        };
+
+        assert_eq!(actual_game_export, expected_game_export);
+    }
+
+    // Game with regulation and an overtime goal should have all the goals
+    #[test]
+    fn extract_export_game_data_regl_ot() {
+        let period_1 = Period { 
+            periodDescriptor: PeriodDetails { 
+                periodType: String::from("REG"),
+            },
+            goals: vec![
+                GoalInfo { eventId: 12, pptReplayUrl: Some(String::from("nhl.com")), homeTeamDefendingSide: String::from("right"), isHome: false}
+            ]
+        };
+        let period_2 = Period { 
+            periodDescriptor: PeriodDetails { 
+                periodType: String::from("REG"),
+            },
+            goals: vec![
+                GoalInfo { eventId: 200, pptReplayUrl: Some(String::from("nhl.com")), homeTeamDefendingSide: String::from("left"), isHome: false}
+            ]
+        };
+        let period_3 = Period { 
+            periodDescriptor: PeriodDetails { 
+                periodType: String::from("REG"),
+            },
+            goals: vec![
+                GoalInfo { eventId: 312, pptReplayUrl: Some(String::from("nhl.com")), homeTeamDefendingSide: String::from("right"), isHome: true},
+                GoalInfo { eventId: 351, pptReplayUrl: Some(String::from("nhl.com")), homeTeamDefendingSide: String::from("right"), isHome: true}
+            ]
+        };
+        let ot = Period { 
+            periodDescriptor: PeriodDetails { 
+                periodType: String::from("OT"),
+            },
+            goals: vec![
+                GoalInfo { eventId: 1114, pptReplayUrl: Some(String::from("nhl.com")), homeTeamDefendingSide: String::from("left"), isHome: true}
+            ]
+        };
+        let summary = Summary { 
+            scoring: vec![
+                period_1,
+                period_2, 
+                period_3,
+                ot,
+            ]
+        };
+        let landing_resp = LandingResponse { 
+            id: 2024000201, season: 20242025, gameDate: String::from("2024-10-29"), 
+            homeTeam: Team { id: 10 }, awayTeam: Team { id: 19 }, summary: summary };
+        
+        let actual_game_export = extract_export_game_data(&landing_resp).unwrap();
+        let expected_game_export = GameExportData {
+            home_team_id: 10,
+            goals: vec![
+                GoalDetails {
+                    event_id: 12,
+                    ppt_replay_url: Some(String::from("nhl.com")),
+                    scoring_team_id: 19,
+                    home_team_defending_side: IceSide::Right
+                },
+                GoalDetails {
+                    event_id: 200,
+                    ppt_replay_url: Some(String::from("nhl.com")),
+                    scoring_team_id: 19,
+                    home_team_defending_side: IceSide::Left
+                },
+                GoalDetails {
+                    event_id: 312,
+                    ppt_replay_url: Some(String::from("nhl.com")),
+                    scoring_team_id: 10,
+                    home_team_defending_side: IceSide::Right
+                },
+                GoalDetails {
+                    event_id: 351,
+                    ppt_replay_url: Some(String::from("nhl.com")),
+                    scoring_team_id: 10,
+                    home_team_defending_side: IceSide::Right
+                },
+                GoalDetails {
+                    event_id: 1114,
+                    ppt_replay_url: Some(String::from("nhl.com")),
+                    scoring_team_id: 10,
+                    home_team_defending_side: IceSide::Left
+                },
+            ]
+        };
+
+        assert_eq!(actual_game_export, expected_game_export);
     }
 }
