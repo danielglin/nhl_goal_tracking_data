@@ -19,8 +19,6 @@ use crate::api_calls::week_or_shorter_period::WeekOrShorterPeriod;
 pub fn save_goal_data<P>(
     client: &Client,
     headers: HeaderMap,
-    // game: &Game,
-    // landing_resp: &LandingResponse,
     season: u32,
     game_id: u32,
     goal: &GoalDetails,
