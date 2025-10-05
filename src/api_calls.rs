@@ -260,7 +260,6 @@ pub fn parse_goal_data(mut pbp: PbpResponse) -> GameExportData {
     // get the details out of all the goals to create GoalDetails
     for goal_event in pbp.plays {
         let event_id = goal_event.eventId;
-        // let ppt_replay_url = goal_event.pptReplayUrl;
         let scoring_team;
 
         // get the home team's defending side
@@ -352,7 +351,6 @@ pub fn get_hometeam_id(client: &Client, game: &Game) -> Result<BoxscoreInfo> {
 
 /// Combines both the goal details from the play-by-play info and boxscore info for a game into one
 /// struct for serialization
-/// Returns an error if the game ids between the two don't match (actually, goal details doesn't have game id, so maybe don't return result)
 pub fn combine_pbp_boxscore_info(
     pbp: Vec<GoalDetails>,
     boxscore_info: BoxscoreInfo,
@@ -486,11 +484,6 @@ pub fn extract_export_game_data(landing_resp: &LandingResponse) -> Result<GameEx
     Ok(GameExportData { goals: goals, home_team_id: landing_resp.homeTeam.id })
 }
 
-/// Get just the goal data needed to pull the tracking JSON's from the landing
-/// response
-pub fn extract_goals() {
-
-}
 
 #[cfg(test)]
 mod tests {
