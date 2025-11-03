@@ -32,6 +32,6 @@ $ cargo run --release -- --dates 2025-10-29::2025-10-31 --output "example_output
 ```
 This saves the goals for all games from October 29, 2025 to October 31, 2025 to the `example_output/` folder.  A folder is created for each date, and within each date's folder are separate folders for each game.  Just like pulling data for a single game, there is one JSON file for each non-shootout goal plus a `pbp_boxscore.json` file with additional information.
 
-# Ackknowledgements
+# Acknowledgements
 
-Stick tap to [Zmalski's NHL API Documentation repo](https://github.com/Zmalski/NHL-API-Reference).
+Stick tap to [Zmalski's NHL API Documentation repo](https://github.com/Zmalski/NHL-API-Reference) for details on the NHL's API.
